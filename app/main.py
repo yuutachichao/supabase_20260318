@@ -1,14 +1,13 @@
 """
 Supabase + Ollama Knowledge Base API
 
-使用本地 Ollama 生成向量，存儲到 Supabase
+使用 Jina AI 或 Ollama 生成向量，存儲到 Supabase
 """
 
 import os
 import json
 import uuid
-from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -20,9 +19,10 @@ app = FastAPI(title="Supabase + Ollama Knowledge Base API")
 # 環境變數
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+JINA_API_KEY = os.getenv("JINA_API_KEY", "")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "nomic-embed-text")
-USE_VECTOR = os.getenv("USE_VECTOR", "false").lower() == "true"
+USE_VECTOR = os.getenv("USE_VECTOR", "true").lower() == "true"
 
 # 初始化 Supabase client
 supabase: Optional[Client] = None
@@ -31,20 +31,38 @@ if SUPABASE_URL and SUPABASE_KEY:
 
 
 def get_embedding(text: str) -> Optional[List[float]]:
-    """使用 Ollama 生成向量"""
+    """使用 Jina AI 生成向量"""
     if not USE_VECTOR:
         return None
-    try:
-        response = requests.post(
-            f"{OLLAMA_BASE_URL}/api/embeddings",
-            json={"model": OLLAMA_MODEL, "prompt": text},
-            timeout=60
-        )
-        response.raise_for_status()
-        return response.json()["embedding"]
-    except Exception as e:
-        print(f"Error getting embedding: {e}")
-        return None
+    
+    # 優先使用 Jina AI
+    if JINA_API_KEY:
+        try:
+            response = requests.post(
+                "https://api.jina.ai/v1/embeddings",
+                headers={"Authorization": f"Bearer {JINA_API_KEY}"},
+                json={"input": text, "model": "jina-embeddings-v2-base-en"},
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json()["data"][0]["embedding"]
+        except Exception as e:
+            print(f"Jina AI error: {e}")
+    
+    # Fallback 到 Ollama
+    if OLLAMA_BASE_URL:
+        try:
+            response = requests.post(
+                f"{OLLAMA_BASE_URL}/api/embeddings",
+                json={"model": OLLAMA_MODEL, "prompt": text},
+                timeout=60
+            )
+            response.raise_for_status()
+            return response.json()["embedding"]
+        except Exception as e:
+            print(f"Ollama error: {e}")
+    
+    return None
 
 
 # --- Pydantic Models ---
@@ -88,7 +106,8 @@ async def root():
     return {
         "status": "ok", 
         "message": "Supabase + Ollama Knowledge Base API",
-        "vector_enabled": USE_VECTOR
+        "vector_enabled": USE_VECTOR,
+        "jina_enabled": bool(JINA_API_KEY)
     }
 
 
@@ -97,7 +116,7 @@ async def health():
     return {"status": "healthy"}
 
 
-@app.post("/ingest/article", response_model=Dict)
+@app.post("/ingest/article", response_model=dict)
 async def ingest_article(article: ArticleIn):
     """新增文章（可選生成向量）"""
     if not supabase:
@@ -135,7 +154,7 @@ async def ingest_article(article: ArticleIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/article/{article_id}", response_model=Dict)
+@app.delete("/article/{article_id}", response_model=dict)
 async def delete_article(article_id: str):
     """刪除文章"""
     if not supabase:
@@ -184,7 +203,6 @@ async def search_articles(search_req: SearchRequest):
     
     # Fallback: 簡單的文字搜尋
     try:
-        # 搜尋標題
         result = supabase.table("articles").select("*").ilike("title", f"%{search_req.query}%").execute()
         
         results = []
@@ -197,7 +215,6 @@ async def search_articles(search_req: SearchRequest):
                 similarity=1.0
             ))
         
-        # 如果標題沒找到，搜尋內容
         if not results:
             result = supabase.table("articles").select("*").ilike("raw_content", f"%{search_req.query}%").execute()
             for item in result.data[:search_req.top_k]:
